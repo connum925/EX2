@@ -1,0 +1,134 @@
+const express = require('express');
+const mysql = require('mysql');
+const admin = require('firebase-admin');
+console.log(__dirname);
+
+const serviceAccount = require("./keys/exm2-6b482-firebase-adminsdk-fbsvc-b8862e0c29.json");
+
+const app = express();
+app.use(express.json());
+const port = 3000;
+
+// MySQL Connection
+const db = mysql.createConnection({
+    host: '127.0.0.1',
+    user: 'root',
+    password: 'root',
+    database: 'fcm_devices'
+});
+
+db.connect((err) => {
+    if (err) {
+        console.error('Database connection failed: ' + err.stack);
+        return;
+    }
+    console.log('Connected to database.');
+});
+
+// Firebase Admin SDK Initialization
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+});
+
+app.post('/register', (req, res) => {
+    const { username, fcm_token } = req.body;
+    if (!username || !fcm_token) {
+        return res.status(400).send({ message: 'Username and FCM token are required.' });
+    }
+
+    const checkQuery = 'SELECT * FROM devices WHERE username = ? AND fcm_token = ?';
+    db.query(checkQuery, [username, fcm_token], (checkErr, checkResults) => {
+        if (checkErr) {
+            console.error('Error checking token: ' + checkErr.stack);
+            return res.status(500).send({ message: 'Error checking token.' });
+        }
+
+        if (checkResults.length > 0) {
+            return res.status(409).send({ message: 'FCM token already registered for this user.' });
+        } else {
+            const insertQuery = 'INSERT INTO devices (username, fcm_token) VALUES (?, ?)';
+            db.query(insertQuery, [username, fcm_token], (insertErr, insertResult) => {
+                if (insertErr) {
+                    console.error('Error saving token: ' + insertErr.stack);
+                    return res.status(500).send({ message: 'Error saving token.' });
+                }
+                console.log('Token saved successfully for user:', username);
+                res.send({ message: 'Token saved successfully.' });
+            });
+        }
+    });
+});
+
+// Endpoint to Send Notification to All Users
+app.post('/send-notification', (req, res) => {
+    const { title, body } = req.body;
+    if (!title || !body) {
+        return res.status(400).send({ message: 'Title and body are required.' });
+    }
+
+    const query = 'SELECT fcm_token FROM devices';
+    db.query(query, (err, results) => {
+        if (err) {
+            console.error('Error fetching tokens: ' + err.stack);
+            return res.status(500).send({ message: 'Error fetching tokens.' });
+        }
+
+        const tokens = results.map(row => row.fcm_token);  //  Just get the tokens
+
+        const sendNotifications = async () => {
+            try {
+                const multicastMessage = {
+                    notification: { title, body },  //  Simplified payload for now
+                    tokens: tokens,
+                };
+
+                console.log("FCM Payload:", JSON.stringify(multicastMessage, null, 2));
+
+                const batchResponse = await admin.messaging().sendEachForMulticast(multicastMessage);
+
+                console.log(`Successfully sent ${batchResponse.successCount} messages`);
+
+                const errors = [];
+                batchResponse.responses.forEach((response, idx) => {
+                    if (!response.success) {
+                        console.error(`Error sending to token ${tokens[idx]}:`, response.error);
+                        errors.push({
+                            token: tokens[idx],
+                            error: response.error,
+                        });
+                    }
+                });
+
+                if (errors.length > 0) {
+                    console.warn(`Some messages had errors:`, errors);
+                    //  **TOKEN CLEANUP (Example)**
+                    errors.forEach(err => {
+                        if (err.error.code === 'messaging/invalid-registration-token' ||
+                            err.error.code === 'messaging/registration-token-not-registered') {
+                            //  Delete the invalid token from your database!
+                            console.log(`Deleting invalid token: ${err.token}`);
+                            db.query('DELETE FROM devices WHERE fcm_token = ?', [err.token], (deleteErr, deleteResult) => {
+                                if (deleteErr) {
+                                    console.error('Database error deleting token:', deleteErr);
+                                } else {
+                                    console.log('Token deleted from database');
+                                }
+                            });
+                        }
+                    });
+                }
+
+                res.send({ message: `${batchResponse.successCount} messages were sent successfully` });
+
+            } catch (error) {
+                console.error('Error sending notifications:', error);
+                res.status(500).send({ message: 'Error sending notifications' });
+            }
+        };
+
+        sendNotifications();
+    });
+});
+app.listen(port, () => {
+    console.log(`Server listening on port ${port}`);
+});
